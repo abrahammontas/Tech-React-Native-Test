@@ -5,8 +5,8 @@
   "description": "Givebutter Assessment - Backend API",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.cjs",
+    "dev": "nodemon server.cjs"
   },
   "keywords": ["givebutter", "assessment"],
   "author": "",
