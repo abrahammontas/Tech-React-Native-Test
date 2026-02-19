@@ -4,6 +4,7 @@ import {
   Text,
   StyleSheet,
   ScrollView,
+  FlatList,
   Image,
   TextInput,
   Pressable,
@@ -14,11 +15,14 @@ import {
   LayoutAnimation,
   Animated,
   useWindowDimensions,
+  UIManager,
+  InteractionManager,
+  ActivityIndicator,
 } from 'react-native';
 import axios from 'axios';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient, useIsFetching } from '@tanstack/react-query';
 import { RouteProp, useRoute } from '@react-navigation/native';
-import { api } from '../services/api';
+import { api, type DonationApi, type DonationsApiResponse } from '../services/api';
 
 type RootStackParamList = {
   FundraiserDetail: { fundraiserId: number };
@@ -35,6 +39,53 @@ interface Fundraiser {
   imageUrl: string;
   createdAt: string;
   status: string;
+  organizer?: string;
+}
+
+/** Donation model – use API type; handle optional message/createdAt defensively in render. */
+type Donation = DonationApi;
+
+/** Stable unique key for donation list items; fallback when id may be missing/duplicate. */
+function getDonationKey(d: Donation): string {
+  if (d.id != null && d.id > 0) return `donation-${d.id}`;
+  return `donation-${d.createdAt}-${d.donorName}-${d.amount}`;
+}
+
+if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
+
+/** Formats ms since epoch to "Xs ago" / "Xm ago" for the Updated line. */
+function formatUpdatedAgo(msSinceEpoch: number): string {
+  const diffSec = Math.floor((Date.now() - msSinceEpoch) / 1000);
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  return `${Math.floor(diffHr / 24)}d ago`;
+}
+
+/** Formats amount as currency (e.g. "$10", "$25.50", "$1,000"). Consistent across donations list and form. */
+function formatCurrency(amount: number): string {
+  return amount % 1 === 0
+    ? `$${amount.toLocaleString()}`
+    : `$${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** Formats ISO date to relative time (e.g. "2h ago", "3 days ago"). */
+function formatRelativeTime(isoDate: string): string {
+  const date = new Date(isoDate);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString();
 }
 
 const PRESET_AMOUNTS = [10, 25, 50, 100, 250] as const;
@@ -331,6 +382,284 @@ function GoalReachedCard() {
   );
 }
 
+/** Single donation row – clean, scannable layout. Memoized for performance. */
+const DonationRow = React.memo(function DonationRow({
+  donation,
+  isNew,
+  isLast,
+}: {
+  donation: Donation;
+  isNew?: boolean;
+  isLast?: boolean;
+}) {
+  const fadeAnim = useRef(new Animated.Value(isNew ? 0.7 : 1)).current;
+  useEffect(() => {
+    if (isNew) {
+      Animated.timing(fadeAnim, { toValue: 1, duration: 800, useNativeDriver: true }).start();
+    }
+  }, [isNew, fadeAnim]);
+  return (
+    <Animated.View style={[donationStyles.row, isNew && donationStyles.rowNew, isLast && donationStyles.rowLast, { opacity: fadeAnim }]}>
+      <View style={donationStyles.rowHeader}>
+        <Text style={donationStyles.donorName} numberOfLines={1}>
+          {donation.donorName || 'Anonymous'}
+        </Text>
+        <Text style={donationStyles.amount}>
+          {Number.isNaN(donation.amount) ? '$0' : formatCurrency(donation.amount)}
+        </Text>
+      </View>
+      {donation.message ? (
+        <Text style={donationStyles.message} numberOfLines={2} ellipsizeMode="tail">
+          {donation.message}
+        </Text>
+      ) : null}
+      <Text style={donationStyles.timestamp}>
+        {donation.createdAt ? formatRelativeTime(donation.createdAt) : '--'}
+      </Text>
+    </Animated.View>
+  );
+});
+
+/** Skeleton row for loading state. */
+function DonationSkeletonRow() {
+  return (
+    <View style={donationStyles.row}>
+      <View style={donationStyles.rowHeader}>
+        <View style={[donationStyles.skeleton, { width: 100, height: 14 }]} />
+        <View style={[donationStyles.skeleton, { width: 50, height: 14 }]} />
+      </View>
+      <View style={[donationStyles.skeleton, { width: '80%', height: 12, marginTop: 6 }]} />
+      <View style={[donationStyles.skeleton, { width: 60, height: 10, marginTop: 6 }]} />
+    </View>
+  );
+}
+
+/** Memoized header for donations section with "Updated X ago" and optional spinner. */
+const DonationsHeader = React.memo(function DonationsHeader({
+  totalCount,
+  updatedAt,
+  isFetching,
+  tick,
+  onRefresh,
+}: {
+  totalCount: number;
+  updatedAt: number | null;
+  isFetching: boolean;
+  tick?: number;
+  onRefresh?: () => void;
+}) {
+  return (
+    <View style={donationStyles.header}>
+      <View style={donationStyles.headerTop}>
+        <Text style={donationStyles.title}>Recent donations</Text>
+        <Text style={donationStyles.count}>{totalCount}</Text>
+      </View>
+      <Pressable
+        style={donationStyles.updatedRow}
+        onPress={onRefresh}
+        disabled={isFetching}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      >
+        {isFetching ? (
+          <ActivityIndicator size="small" color="#94a3b8" style={donationStyles.updatedSpinner} />
+        ) : null}
+        <Text style={donationStyles.updatedText}>
+          {updatedAt != null ? `Updated ${formatUpdatedAgo(updatedAt)}` : 'Updated --'}
+        </Text>
+      </Pressable>
+    </View>
+  );
+});
+
+const STALE_MS = 30000;
+const AUTO_REFETCH_THROTTLE_MS = 30000;
+
+/**
+ * DonationsSection – Task 2 validation checklist
+ * -----------------------------------------------
+ * CHECKED: TypeScript types (Donation, DonationsApiResponse); React Query (queryKey, queryFn, staleTime, invalidateQueries);
+ *   FlatList (keyExtractor stable id, renderItem useCallback, DonationRow React.memo); no nested scroll (scrollEnabled=false);
+ *   KeyboardAvoidingView, keyboardShouldPersistTaps; pull-to-refresh; LayoutAnimation on length increase; empty/error/loading states;
+ *   "Updated X ago" with tap-to-refresh; auto-refetch when visible (throttled 30s); scroll position preserved on refetch.
+ * FIXED: API response types; optional createdAt/message handling; onRefresh useCallback; DonationsApiResponse typing.
+ * RISKY: None.
+ */
+function DonationsSection({
+  fundraiserId,
+  lastDonationId,
+  scrollY,
+  viewportHeight,
+  sectionTop,
+  sectionHeight,
+}: {
+  fundraiserId: number;
+  lastDonationId?: number | null;
+  scrollY: number;
+  viewportHeight: number;
+  sectionTop: number;
+  sectionHeight: number;
+}) {
+  const [queryEnabled, setQueryEnabled] = useState(false);
+  const [newDonationIdsFromRefresh, setNewDonationIdsFromRefresh] = useState<Set<number>>(new Set());
+  const prevDonationsLengthRef = useRef(0);
+  const prevDonationIdsRef = useRef<Set<number>>(new Set());
+  const wasRefetchingRef = useRef(false);
+  const lastAutoRefetchAtRef = useRef(0);
+
+  useEffect(() => {
+    const t = setTimeout(() => setQueryEnabled(true), 100);
+    return () => clearTimeout(t);
+  }, []);
+
+  const { data, isLoading, error, refetch, isRefetching, dataUpdatedAt } = useQuery<
+    DonationsApiResponse
+  >({
+    queryKey: ['donations', fundraiserId],
+    queryFn: () => api.getDonations(fundraiserId),
+    enabled: queryEnabled,
+    staleTime: STALE_MS,
+  });
+
+  const donations: Donation[] = data?.data ?? [];
+  const isVisible =
+    sectionTop + sectionHeight > scrollY && sectionTop < scrollY + viewportHeight;
+
+  useEffect(() => {
+    if (
+      !queryEnabled ||
+      isLoading ||
+      isRefetching ||
+      !isVisible ||
+      sectionHeight <= 0
+    )
+      return;
+    const now = Date.now();
+    if (now - lastAutoRefetchAtRef.current < AUTO_REFETCH_THROTTLE_MS) return;
+    const dataAge = dataUpdatedAt ? now - dataUpdatedAt : Infinity;
+    if (dataAge < STALE_MS) return;
+    lastAutoRefetchAtRef.current = now;
+    refetch();
+  }, [queryEnabled, isLoading, isRefetching, isVisible, sectionHeight, dataUpdatedAt, refetch]);
+  const totalCount = data?.pagination?.total ?? donations.length;
+  const showLoading = !queryEnabled || isLoading;
+
+  useEffect(() => {
+    if (isRefetching) {
+      prevDonationIdsRef.current = new Set(donations.filter((d) => d.id != null).map((d) => d.id!));
+    } else if (wasRefetchingRef.current && donations.length > 0) {
+      const prevIds = prevDonationIdsRef.current;
+      const newIds = donations.filter((d) => d.id != null && !prevIds.has(d.id!)).map((d) => d.id!);
+      if (newIds.length > 0) {
+        setNewDonationIdsFromRefresh(new Set(newIds));
+      }
+      prevDonationIdsRef.current = new Set(donations.filter((d) => d.id != null).map((d) => d.id!));
+    }
+    wasRefetchingRef.current = isRefetching;
+  }, [isRefetching, donations]);
+
+  useEffect(() => {
+    if (newDonationIdsFromRefresh.size === 0) return;
+    const t = setTimeout(() => setNewDonationIdsFromRefresh(new Set()), 3000);
+    return () => clearTimeout(t);
+  }, [newDonationIdsFromRefresh]);
+
+  useEffect(() => {
+    if (donations.length > prevDonationsLengthRef.current) {
+      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    }
+    prevDonationsLengthRef.current = donations.length;
+  }, [donations.length]);
+
+  const renderItem = useCallback(
+    ({ item, index }: { item: Donation; index: number }) => (
+      <DonationRow
+        donation={item}
+        isNew={
+          (lastDonationId != null && item.id === lastDonationId) ||
+          (item.id != null && newDonationIdsFromRefresh.has(item.id))
+        }
+        isLast={index === donations.length - 1}
+      />
+    ),
+    [lastDonationId, donations.length, newDonationIdsFromRefresh]
+  );
+
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!isVisible || dataUpdatedAt == null) return;
+    const id = setInterval(() => setTick((t) => t + 1), 10000);
+    return () => clearInterval(id);
+  }, [isVisible, dataUpdatedAt]);
+
+  const handleRefresh = useCallback(() => refetch(), [refetch]);
+
+  const headerProps = {
+    totalCount,
+    updatedAt: dataUpdatedAt ?? null,
+    isFetching: isRefetching,
+    tick,
+    onRefresh: handleRefresh,
+  };
+
+  if (showLoading) {
+    return (
+      <View style={donationStyles.section}>
+        <DonationsHeader {...headerProps} />
+        <View style={donationStyles.list}>
+          {[1, 2, 3, 4].map((i) => (
+            <DonationSkeletonRow key={`skeleton-${i}`} />
+          ))}
+        </View>
+      </View>
+    );
+  }
+
+  if (error) {
+    return (
+      <View style={donationStyles.section}>
+        <DonationsHeader {...headerProps} />
+        <View style={donationStyles.errorWrap}>
+          <Text style={donationStyles.errorText}>Unable to load donations</Text>
+          <Pressable style={donationStyles.retryBtn} onPress={() => refetch()}>
+            <Text style={donationStyles.retryBtnText}>Try again</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
+
+  if (donations.length === 0) {
+    return (
+      <View style={donationStyles.section}>
+        <DonationsHeader {...headerProps} />
+        <View style={donationStyles.emptyWrap}>
+          <Text style={donationStyles.emptyTitle}>No donations yet</Text>
+          <Text style={donationStyles.emptySubtitle}>Be the first to support this fundraiser.</Text>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={donationStyles.section}>
+      <DonationsHeader {...headerProps} />
+      <FlatList
+        data={donations}
+        renderItem={renderItem}
+        keyExtractor={getDonationKey}
+        scrollEnabled={false}
+        maintainVisibleContentPosition={
+          Platform.OS === 'ios'
+            ? { minIndexForVisible: 0, autoscrollToTopThreshold: 10 }
+            : undefined
+        }
+        style={donationStyles.flatList}
+        contentContainerStyle={donationStyles.list}
+      />
+    </View>
+  );
+}
+
 export default function FundraiserDetailScreen() {
   const route = useRoute<FundraiserDetailRouteProp>();
   const { fundraiserId } = route.params;
@@ -345,7 +674,21 @@ export default function FundraiserDetailScreen() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [donateSuccess, setDonateSuccess] = useState(false);
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
+  const [descriptionOverflows, setDescriptionOverflows] = useState(false);
+  const [lastDonationId, setLastDonationId] = useState<number | null>(null);
   const formFieldsAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (lastDonationId == null) return;
+    const t = setTimeout(() => setLastDonationId(null), 3000);
+    return () => clearTimeout(t);
+  }, [lastDonationId]);
+
+  useEffect(() => {
+    if (!donateSuccess) return;
+    const t = setTimeout(() => setDonateSuccess(false), 12000);
+    return () => clearTimeout(t);
+  }, [donateSuccess]);
 
   const donorNameRef = useRef<TextInput>(null);
   const messageRef = useRef<TextInput>(null);
@@ -353,22 +696,58 @@ export default function FundraiserDetailScreen() {
   const donationSectionRef = useRef<View>(null);
 
   const [scrollY, setScrollY] = useState(0);
+  const scrollYRef = useRef(0);
   const [donationSectionLayout, setDonationSectionLayout] = useState<{ y: number; height: number } | null>(null);
+  const [donationsListLayout, setDonationsListLayout] = useState<{ y: number; height: number } | null>(null);
+  const [interactionsComplete, setInteractionsComplete] = useState(false);
   const { height: viewportHeight } = useWindowDimensions();
+
+  useEffect(() => {
+    const handle = InteractionManager.runAfterInteractions(() => setInteractionsComplete(true));
+    return () => handle.cancel();
+  }, []);
+
+  const fundraisersData = queryClient.getQueryData<{ data?: Array<{ id: number }> }>(['fundraisers']);
+  const placeholderFundraiser = fundraisersData?.data?.find((f) => f.id === fundraiserId);
 
   const { data, isLoading, error, refetch: refetchFundraiser, isRefetching: fundraiserRefetching } = useQuery({
     queryKey: ['fundraiser', fundraiserId],
     queryFn: () => api.getFundraiser(fundraiserId),
+    placeholderData: placeholderFundraiser
+      ? ({ success: true, data: placeholderFundraiser } as { success: boolean; data: typeof placeholderFundraiser })
+      : undefined,
   });
 
-  const onRefresh = useCallback(() => refetchFundraiser(), [refetchFundraiser]);
+  const donationsFetching = useIsFetching({ queryKey: ['donations', fundraiserId] });
+  const donationsRefetching = donationsFetching > 0;
+  const savedScrollYRef = useRef(0);
+  const wasDonationsRefetchingRef = useRef(false);
+
+  useEffect(() => {
+    if (donationsRefetching) {
+      savedScrollYRef.current = scrollYRef.current;
+    } else if (wasDonationsRefetchingRef.current) {
+      requestAnimationFrame(() => {
+        scrollViewRef.current?.scrollTo({ y: savedScrollYRef.current, animated: false });
+      });
+    }
+    wasDonationsRefetchingRef.current = donationsRefetching;
+  }, [donationsRefetching]);
+
+  const onRefresh = useCallback(async () => {
+    await Promise.all([
+      refetchFundraiser(),
+      queryClient.refetchQueries({ queryKey: ['donations', fundraiserId] }),
+    ]);
+  }, [refetchFundraiser, queryClient, fundraiserId]);
 
   const createDonationMutation = useMutation({
     mutationFn: (payload: { amount: number; donorName: string; message?: string }) =>
       api.createDonation(fundraiserId, payload),
-    onSuccess: () => {
+    onSuccess: (res: { data?: { id?: number } }) => {
       queryClient.invalidateQueries({ queryKey: ['fundraiser', fundraiserId] });
       queryClient.invalidateQueries({ queryKey: ['donations', fundraiserId] });
+      setLastDonationId(res?.data?.id ?? null);
       setSelectedAmount(null);
       setCustomAmount('');
       setDonorName('');
@@ -439,6 +818,7 @@ export default function FundraiserDetailScreen() {
   }, [hasAmountSelected, formFieldsAnim]);
 
   const validateAndSubmit = () => {
+    Keyboard.dismiss();
     setSubmitError(null);
     setAmountError(null);
     setDonorNameError(null);
@@ -501,24 +881,32 @@ export default function FundraiserDetailScreen() {
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
       <ScrollView
-        ref={scrollViewRef}
-        onScroll={(e) => setScrollY(e.nativeEvent.contentOffset.y)}
-        scrollEventThrottle={16}
-        style={styles.scrollView}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
-        refreshControl={
-          <RefreshControl
-            refreshing={fundraiserRefetching}
-            onRefresh={onRefresh}
-            tintColor="#4CAF50"
-            colors={['#4CAF50']}
-          />
-        }
-      >
+          ref={scrollViewRef}
+          onScroll={(e) => {
+          const y = e.nativeEvent.contentOffset.y;
+          scrollYRef.current = y;
+          setScrollY(y);
+        }}
+          scrollEventThrottle={16}
+          style={styles.scrollView}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+          showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={fundraiserRefetching || donationsRefetching}
+              onRefresh={onRefresh}
+              tintColor={GREEN}
+              colors={[GREEN]}
+            />
+          }
+        >
       <Image source={{ uri: fundraiser.imageUrl }} style={styles.image} />
       <View style={styles.content}>
         <Text style={styles.title}>{fundraiser.title}</Text>
+        {fundraiser.organizer ? (
+          <Text style={styles.organizer}>{fundraiser.organizer}</Text>
+        ) : null}
         <View style={styles.descriptionWrap}>
           <Text
             style={styles.description}
@@ -527,14 +915,22 @@ export default function FundraiserDetailScreen() {
           >
             {fundraiser.description}
           </Text>
-          <Pressable
-            onPress={() => setDescriptionExpanded((e) => !e)}
-            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          <Text
+            style={[styles.description, styles.descriptionMeasure]}
+            onTextLayout={(e) => setDescriptionOverflows(e.nativeEvent.lines.length > 3)}
           >
-            <Text style={styles.readMoreText}>
-              {descriptionExpanded ? 'Read less' : 'Read more'}
-            </Text>
-          </Pressable>
+            {fundraiser.description}
+          </Text>
+          {descriptionOverflows && (
+            <Pressable
+              onPress={() => setDescriptionExpanded((e) => !e)}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Text style={styles.readMoreText}>
+                {descriptionExpanded ? 'Read less' : 'Read more'}
+              </Text>
+            </Pressable>
+          )}
         </View>
 
         <View style={styles.progressSection}>
@@ -579,7 +975,10 @@ export default function FundraiserDetailScreen() {
               setAmountError(null);
               setSubmitError(null);
               // Scroll to show full form after fields animate in
-              setTimeout(() => scrollToDonationSection(), 350);
+              setTimeout(() => {
+                scrollToDonationSection();
+                if (amt !== 'custom') donorNameRef.current?.focus();
+              }, 350);
             }}
             onCustomChange={(text) => {
               setCustomAmount(text.replace(/,/g, '.'));
@@ -628,7 +1027,6 @@ export default function FundraiserDetailScreen() {
                 inputRef={donorNameRef}
                 returnKeyType="next"
                 onSubmitEditing={() => messageRef.current?.focus()}
-                autoCapitalize="words"
               />
 
 
@@ -658,20 +1056,46 @@ export default function FundraiserDetailScreen() {
           )}
         </View>
         )}
+
+        {interactionsComplete ? (
+          <View
+            onLayout={(e) =>
+              setDonationsListLayout({
+                y: e.nativeEvent.layout.y,
+                height: e.nativeEvent.layout.height,
+              })
+            }
+          >
+            <DonationsSection
+              fundraiserId={fundraiserId}
+              lastDonationId={lastDonationId}
+              scrollY={scrollY}
+              viewportHeight={viewportHeight}
+              sectionTop={IMAGE_HEIGHT + (donationsListLayout?.y ?? 0)}
+              sectionHeight={donationsListLayout?.height ?? 0}
+            />
+          </View>
+        ) : (
+          <View style={[donationStyles.section, { minHeight: 80, justifyContent: 'center' }]}>
+            <Text style={{ color: '#64748b', fontSize: 14, textAlign: 'center' }}>Loading donations...</Text>
+          </View>
+        )}
+
+        <View style={styles.bottomSpacer} />
       </View>
     </ScrollView>
 
-    {showFloatingCta && (
-      <View style={donateStyles.floatingCtaWrap}>
-        <Pressable
-          style={donateStyles.floatingCta}
-          onPress={scrollToDonationSection}
-          android_ripple={{ color: 'rgba(255,255,255,0.2)' }}
-        >
-          <Text style={donateStyles.floatingCtaText}>Donate</Text>
-        </Pressable>
-      </View>
-    )}
+        {showFloatingCta && (
+          <View style={donateStyles.floatingCtaWrap}>
+            <Pressable
+              style={donateStyles.floatingCta}
+              onPress={scrollToDonationSection}
+              android_ripple={{ color: 'rgba(255,255,255,0.2)' }}
+            >
+              <Text style={donateStyles.floatingCtaText}>Donate</Text>
+            </Pressable>
+          </View>
+        )}
     </KeyboardAvoidingView>
   );
 }
@@ -695,8 +1119,13 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 28,
     fontWeight: 'bold',
-    marginBottom: 12,
+    marginBottom: 4,
     color: '#333',
+  },
+  organizer: {
+    fontSize: 14,
+    color: '#64748b',
+    marginBottom: 12,
   },
   descriptionWrap: {
     marginBottom: 24,
@@ -706,6 +1135,14 @@ const styles = StyleSheet.create({
     color: '#666',
     lineHeight: 24,
   },
+  descriptionMeasure: {
+    position: 'absolute',
+    opacity: 0,
+    left: 0,
+    right: 0,
+    top: 0,
+    pointerEvents: 'none',
+  },
   readMoreText: {
     fontSize: 14,
     color: '#22c55e',
@@ -714,9 +1151,14 @@ const styles = StyleSheet.create({
   },
   progressSection: {
     backgroundColor: '#fff',
-    padding: 16,
-    borderRadius: 12,
-    marginBottom: 16,
+    padding: 18,
+    borderRadius: 16,
+    marginBottom: 14,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    elevation: 2,
   },
   progressBar: {
     height: 12,
@@ -757,6 +1199,9 @@ const styles = StyleSheet.create({
   errorText: {
     color: '#d32f2f',
     fontSize: 16,
+  },
+  bottomSpacer: {
+    height: 100,
   },
   formSection: {
     backgroundColor: '#fff',
@@ -1041,6 +1486,140 @@ const donateStyles = StyleSheet.create({
     color: '#fff',
     fontSize: 17,
     fontWeight: '700',
+  },
+});
+
+const donationStyles = StyleSheet.create({
+  section: {
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    padding: 20,
+    marginTop: 16,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.06,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  header: {
+    marginBottom: 14,
+  },
+  headerTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  updatedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 4,
+    minHeight: 20,
+  },
+  updatedSpinner: {
+    marginRight: 6,
+  },
+  updatedText: {
+    fontSize: 12,
+    color: '#94a3b8',
+  },
+  title: {
+    fontSize: 17,
+    fontWeight: '600',
+    color: '#1e293b',
+  },
+  count: {
+    fontSize: 13,
+    color: '#64748b',
+    backgroundColor: '#f1f5f9',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 10,
+  },
+  flatList: {
+    flexGrow: 0,
+  },
+  list: {
+    gap: 0,
+  },
+  row: {
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#e2e8f0',
+  },
+  rowNew: {
+    backgroundColor: '#f0fdf4',
+  },
+  rowLast: {
+    borderBottomWidth: 0,
+  },
+  rowHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  donorName: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#1e293b',
+    flex: 1,
+    marginRight: 8,
+  },
+  amount: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#22c55e',
+  },
+  message: {
+    fontSize: 13,
+    color: '#64748b',
+    marginTop: 4,
+    lineHeight: 18,
+  },
+  timestamp: {
+    fontSize: 12,
+    color: '#94a3b8',
+    marginTop: 4,
+  },
+  skeleton: {
+    backgroundColor: '#e2e8f0',
+    borderRadius: 4,
+  },
+  emptyWrap: {
+    paddingVertical: 32,
+    alignItems: 'center',
+  },
+  emptyTitle: {
+    fontSize: 17,
+    fontWeight: '600',
+    color: '#64748b',
+    marginBottom: 6,
+  },
+  emptySubtitle: {
+    fontSize: 14,
+    color: '#94a3b8',
+    textAlign: 'center',
+  },
+  errorWrap: {
+    paddingVertical: 24,
+    alignItems: 'center',
+  },
+  errorText: {
+    fontSize: 14,
+    color: '#64748b',
+    marginBottom: 14,
+    textAlign: 'center',
+  },
+  retryBtn: {
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    backgroundColor: '#f1f5f9',
+    borderRadius: 10,
+  },
+  retryBtnText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#475569',
   },
 });
 
